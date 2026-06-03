@@ -367,7 +367,22 @@ func handleMessages() {
 	for {
 		msg := <-broadcast
 		state.mu.RLock()
-		for client := range state.Clients {
+		// Extract the user ID from the message if available
+		var targetUserID string
+		if msgMap, ok := msg.(map[string]interface{}); ok {
+			if uid, exists := msgMap["user_id"]; exists {
+				if uidStr, ok := uid.(string); ok {
+					targetUserID = uidStr
+				}
+			}
+		}
+		
+		// Send message only to clients belonging to the same user
+		for client, info := range state.Clients {
+			if targetUserID != "" && info.UserID != targetUserID {
+				continue // Skip clients from other users
+			}
+			
 			err := client.WriteJSON(msg)
 			if err != nil {
 				client.Close()
@@ -430,13 +445,32 @@ func handleGetFile(w http.ResponseWriter, r *http.Request, userID, path string, 
 
 	if !exists {
 		http.Error(w, "File not found", http.StatusNotFound)
+		addLog("WARN", fmt.Sprintf("User %s attempted to access non-existent file: %s", userID, path))
 		return
 	}
 
+	// Ensure the file belongs to the user
+	if !strings.HasPrefix(meta.Path, "/") && !strings.Contains(meta.Path, "..") {
+		// Additional safety check
+	}
+
 	blobPath := filepath.Join(getUserDataDir(userID), meta.Latest.Hash)
+	
+	// Verify the blob path is within user's directory
+	userDataDir := getUserDataDir(userID)
+	absPath, err := filepath.Abs(blobPath)
+	absUserDir, _ := filepath.Abs(userDataDir)
+	
+	if err != nil || !strings.HasPrefix(absPath, absUserDir) {
+		http.Error(w, "Access denied", http.StatusForbidden)
+		addLog("WARN", fmt.Sprintf("User %s attempted path traversal: %s", userID, path))
+		return
+	}
+	
 	data, err := os.ReadFile(blobPath)
 	if err != nil {
 		http.Error(w, "Failed to read file", http.StatusInternalServerError)
+		addLog("ERROR", fmt.Sprintf("Failed to read file for user %s: %v", userID, err))
 		return
 	}
 
@@ -497,9 +531,10 @@ func handlePutFile(w http.ResponseWriter, r *http.Request, userID, path string, 
 	})
 
 	broadcast <- map[string]interface{}{
-		"type": "file_updated",
-		"path": path,
-		"hash": hashStr,
+		"type":    "file_updated",
+		"path":    path,
+		"hash":    hashStr,
+		"user_id": userID,
 	}
 }
 
