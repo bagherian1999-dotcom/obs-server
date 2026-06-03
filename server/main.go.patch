@@ -1,0 +1,53 @@
+--- a/server/main.go
++++ b/server/main.go
+@@ -18,10 +18,9 @@ import (
+ )
+ 
+ const (
+-	Port         = ":8080"
+-	DataDir      = "./data"
+ 	MetadataFile = "./metadata.json"
+ 	MaxLogs      = 100
++	ConfigFile   = "./config.json"
+ )
+ 
+ // --- Data Structures ---
+@@ -76,8 +75,15 @@ var broadcast = make(chan interface{})
+ // --- Main ---
+ 
+ func main() {
++	// Load configuration
++	if err := loadConfig(ConfigFile); err != nil {
++		log.Printf("Warning: Could not load config file (%v), using defaults", err)
++	}
++
++	DataDir := config.DataDir
++	
+ 	// Ensure data directory exists
+-	if err := os.MkdirAll(DataDir, 0755); err != nil {
++	if err := os.MkdirAll(config.DataDir, 0755); err != nil {
+ 		log.Fatal("Failed to create data directory:", err)
+ 	}
+ 
+@@ -99,9 +105,18 @@ func main() {
+ 	// Web Interface
+ 	http.HandleFunc("/", handleDashboard)
+ 
+-	addLog("INFO", fmt.Sprintf("GoSync Server listening on %s", Port))
+-	fmt.Printf("GoSync Server started at http://localhost%s\n", Port)
++	serverAddr := config.GetAddress()
++	publicURL := config.GetPublicURL()
+ 	
+-	log.Fatal(http.ListenAndServe(Port, nil))
++	addLog("INFO", fmt.Sprintf("GoSync Server listening on %s", serverAddr))
++	fmt.Printf("GoSync Server started at %s\n", publicURL)
++	
++	if config.EnableSSL {
++		addLog("INFO", "SSL enabled")
++		log.Fatal(http.ListenAndServeTLS(serverAddr, config.SSLCertPath, config.SSLKeyPath, nil))
++	} else {
++		addLog("INFO", "Running without SSL (HTTP only)")
++		log.Fatal(http.ListenAndServe(serverAddr, nil))
++	}
+ }
+ 

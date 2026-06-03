@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  gosync:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gosync-server
+    ports:
+      - "${PORT:-8080}:${PORT:-8080}"
+    volumes:
+      - ./data:/app/data
+      - ./server/config.json:/app/config.json
+      - ./ssl:/app/ssl:ro
+    environment:
+      - TZ=UTC
+    restart: unless-stopped
+    networks:
+      - gosync-network
+
+networks:
+  gosync-network:
+    driver: bridge

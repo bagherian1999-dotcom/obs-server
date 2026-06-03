@@ -1,0 +1,9 @@
+{
+  "host": "0.0.0.0",
+  "port": "8080",
+  "domain": "",
+  "enable_ssl": false,
+  "ssl_cert_path": "/etc/ssl/certs/gosync.crt",
+  "ssl_key_path": "/etc/ssl/private/gosync.key",
+  "data_dir": "./data"
+}
