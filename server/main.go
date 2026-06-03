@@ -18,9 +18,8 @@ import (
 )
 
 const (
-	MetadataFile = "./metadata.json"
-	MaxLogs      = 100
-	ConfigFile   = "./config.json"
+	MaxLogs    = 100
+	ConfigFile = "./config.json"
 )
 
 // --- Data Structures ---
@@ -32,44 +31,52 @@ type FileVersion struct {
 }
 
 type FileMetadata struct {
-	Path      string        `json:"path"`
-	History   []FileVersion `json:"history"` // History of changes
-	Latest    FileVersion   `json:"latest"`  // Shortcut to head
+	Path    string        `json:"path"`
+	History []FileVersion `json:"history"`
+	Latest  FileVersion   `json:"latest"`
 }
 
 type LogEntry struct {
 	Timestamp time.Time `json:"timestamp"`
 	Message   string    `json:"message"`
-	Level     string    `json:"level"` // INFO, ERROR, CONNECT
+	Level     string    `json:"level"`
 }
 
 type ClientInfo struct {
 	ID          string    `json:"id"`
 	Name        string    `json:"name"`
 	IP          string    `json:"ip"`
-	Pn          string    `json:"pn"` // Plugin Name/Version if available
+	Pn          string    `json:"pn"`
+	UserID      string    `json:"user_id"`
 	ConnectedAt time.Time `json:"connectedAt"`
 }
 
 type ServerState struct {
 	mu      sync.RWMutex
-	Files   map[string]FileMetadata
 	Clients map[*websocket.Conn]*ClientInfo
 	Logs    []LogEntry
+}
+
+// User-specific file state (per user)
+type UserFileState struct {
+	mu    sync.RWMutex
+	Files map[string]FileMetadata
 }
 
 // --- Globals ---
 
 var state = ServerState{
-	Files:   make(map[string]FileMetadata),
 	Clients: make(map[*websocket.Conn]*ClientInfo),
 	Logs:    make([]LogEntry, 0),
 }
 
+var userFileStates = make(map[string]*UserFileState) // key: userID
+var userFileStatesMu sync.RWMutex
+
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
-		return true 
-		},
+		return true
+	},
 }
 
 var broadcast = make(chan interface{})
@@ -87,32 +94,41 @@ func main() {
 		log.Fatal("Failed to create data directory:", err)
 	}
 
-	loadMetadata()
-	addLog("INFO", "Server started. Loading metadata...")
+	// Initialize user store
+	if err := initUserStore(); err != nil {
+		log.Fatal("Failed to initialize user store:", err)
+	}
+
+	addLog("INFO", "Server started with authentication enabled")
 
 	go handleMessages()
 
-	// API
-	http.HandleFunc("/api/files", enableCors(handleListFiles))
-	http.HandleFunc("/api/file", enableCors(handleFileOperations))
-	http.HandleFunc("/api/files/delete", enableCors(handleBulkDelete))
-	http.HandleFunc("/api/search", enableCors(handleSearch))
-	http.HandleFunc("/api/cleanup", enableCors(handleCleanup))
-	http.HandleFunc("/api/reset", enableCors(handleReset))
-	http.HandleFunc("/api/status", enableCors(handleServerStatus))
-	
-	// WebSocket
-	http.HandleFunc("/ws", handleConnections)
-
-	// Web Interface
+	// Public endpoints
+	http.HandleFunc("/api/register", enableCors(handleRegister))
+	http.HandleFunc("/api/login", enableCors(handleLogin))
 	http.HandleFunc("/", handleDashboard)
+
+	// Protected endpoints (require authentication)
+	http.HandleFunc("/api/profile", enableCorsWithAuth(requireAuth(handleProfile)))
+	http.HandleFunc("/api/verify", enableCorsWithAuth(requireAuth(handleVerifyToken)))
+	http.HandleFunc("/api/files", enableCorsWithAuth(requireAuth(handleListFiles)))
+	http.HandleFunc("/api/file", enableCorsWithAuth(requireAuth(handleFileOperations)))
+	http.HandleFunc("/api/files/delete", enableCorsWithAuth(requireAuth(handleBulkDelete)))
+	http.HandleFunc("/api/search", enableCorsWithAuth(requireAuth(handleSearch)))
+	http.HandleFunc("/api/cleanup", enableCorsWithAuth(requireAuth(handleCleanup)))
+	http.HandleFunc("/api/reset", enableCorsWithAuth(requireAuth(handleReset)))
+	http.HandleFunc("/api/status", enableCorsWithAuth(requireAuth(handleServerStatus)))
+
+	// WebSocket (requires authentication via query param)
+	http.HandleFunc("/ws", handleConnections)
 
 	serverAddr := config.GetAddress()
 	publicURL := config.GetPublicURL()
-	
+
 	addLog("INFO", fmt.Sprintf("GoSync Server listening on %s", serverAddr))
 	fmt.Printf("GoSync Server started at %s\n", publicURL)
-	
+	fmt.Printf("Authentication enabled - users must register/login\n")
+
 	if config.EnableSSL {
 		addLog("INFO", "SSL enabled")
 		log.Fatal(http.ListenAndServeTLS(serverAddr, config.SSLCertPath, config.SSLKeyPath, nil))
@@ -122,22 +138,83 @@ func main() {
 	}
 }
 
-// --- Middleware ---
+// --- User File State Management ---
 
-func enableCors(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+func getUserFileState(userID string) *UserFileState {
+	userFileStatesMu.RLock()
+	ufs, exists := userFileStates[userID]
+	userFileStatesMu.RUnlock()
 
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		next(w, r)
+	if exists {
+		return ufs
 	}
+
+	// Create new state
+	userFileStatesMu.Lock()
+	defer userFileStatesMu.Unlock()
+
+	// Double-check after lock
+	if ufs, exists := userFileStates[userID]; exists {
+		return ufs
+	}
+
+	ufs = &UserFileState{
+		Files: make(map[string]FileMetadata),
+	}
+	userFileStates[userID] = ufs
+
+	// Load metadata for this user
+	loadUserMetadata(userID, ufs)
+
+	return ufs
+}
+
+func loadUserMetadata(userID string, ufs *UserFileState) {
+	metadataFile := getUserMetadataFile(userID)
+
+	file, err := os.Open(metadataFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return // No metadata yet
+		}
+		addLog("ERROR", fmt.Sprintf("Failed to load metadata for user %s: %v", userID, err))
+		return
+	}
+	defer file.Close()
+
+	var files map[string]FileMetadata
+	if err := json.NewDecoder(file).Decode(&files); err != nil {
+		addLog("ERROR", fmt.Sprintf("Failed to decode metadata for user %s: %v", userID, err))
+		return
+	}
+
+	ufs.mu.Lock()
+	ufs.Files = files
+	ufs.mu.Unlock()
+
+	addLog("INFO", fmt.Sprintf("Loaded %d files for user %s", len(files), userID))
+}
+
+func saveUserMetadata(userID string, ufs *UserFileState) error {
+	metadataFile := getUserMetadataFile(userID)
+
+	// Ensure directory exists
+	if err := os.MkdirAll(filepath.Dir(metadataFile), 0755); err != nil {
+		return err
+	}
+
+	ufs.mu.RLock()
+	defer ufs.mu.RUnlock()
+
+	file, err := os.Create(metadataFile)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(ufs.Files)
 }
 
 // --- Logging & State Helpers ---
@@ -151,14 +228,12 @@ func addLog(level, message string) {
 		Message:   message,
 		Level:     level,
 	}
-	
-	// Prepend or Append? Append is standard, UI can reverse.
+
 	state.Logs = append(state.Logs, entry)
 	if len(state.Logs) > MaxLogs {
 		state.Logs = state.Logs[1:]
 	}
-	
-	// Also print to stdout
+
 	fmt.Printf("[%s] %s: %s\n", entry.Timestamp.Format("15:04:05"), level, message)
 }
 
@@ -174,23 +249,34 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleServerStatus(w http.ResponseWriter, r *http.Request) {
+	user, ok := getUserFromContext(r)
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	state.mu.RLock()
 	defer state.mu.RUnlock()
 
-	// Convert Clients map to list for JSON
-	clientList := make([]*ClientInfo, 0, len(state.Clients))
-	for _, c := range state.Clients {
-		clientList = append(clientList, c)
-	}
+	// Get user's file state
+	ufs := getUserFileState(user.ID)
+	ufs.mu.RLock()
+	fileCount := len(ufs.Files)
+	ufs.mu.RUnlock()
 
-	// Files list summary
-	fileCount := len(state.Files)
+	// Convert Clients map to list for this user
+	clientList := make([]*ClientInfo, 0)
+	for _, c := range state.Clients {
+		if c.UserID == user.ID {
+			clientList = append(clientList, c)
+		}
+	}
 
 	response := map[string]interface{}{
 		"clients":   clientList,
 		"logs":      state.Logs,
 		"fileCount": fileCount,
-		"uptime":    "Not tracked", // Could add
+		"user":      user.Username,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -198,6 +284,26 @@ func handleServerStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleConnections(w http.ResponseWriter, r *http.Request) {
+	// Get token from query parameter for WebSocket
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		http.Error(w, "Authentication required", http.StatusUnauthorized)
+		return
+	}
+
+	// Verify token
+	claims, err := verifyToken(token)
+	if err != nil {
+		http.Error(w, "Invalid token", http.StatusUnauthorized)
+		return
+	}
+
+	user, err := getUserByID(claims.UserID)
+	if err != nil {
+		http.Error(w, "User not found", http.StatusUnauthorized)
+		return
+	}
+
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		addLog("ERROR", fmt.Sprintf("WebSocket Upgrade error: %v", err))
@@ -206,12 +312,13 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 	defer ws.Close()
 
 	clientIP := r.RemoteAddr
-	deviceName := "Unknown"
+	deviceName := user.Username
 
 	info := &ClientInfo{
 		ID:          fmt.Sprintf("%d", time.Now().UnixNano()),
 		Name:        deviceName,
 		IP:          clientIP,
+		UserID:      user.ID,
 		ConnectedAt: time.Now(),
 	}
 
@@ -219,9 +326,8 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 	state.Clients[ws] = info
 	state.mu.Unlock()
 
-	addLog("CONNECT", fmt.Sprintf("Client connected: %s (%s)", deviceName, clientIP))
+	addLog("CONNECT", fmt.Sprintf("Client connected: %s (User: %s)", clientIP, user.Username))
 
-	// Standard loop
 	for {
 		var msg map[string]interface{}
 		err := ws.ReadJSON(&msg)
@@ -234,32 +340,22 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
-		// Handle messages
 		if msgType, ok := msg["type"].(string); ok {
 			if msgType == "identify" {
 				if name, ok := msg["deviceName"].(string); ok {
 					deviceName = name
-					
 					state.mu.Lock()
-					if client, exists := state.Clients[ws]; exists {
-						client.Name = deviceName
+					info.Name = deviceName
+					if pn, ok := msg["pluginName"].(string); ok {
+						info.Pn = pn
 					}
 					state.mu.Unlock()
-					
-					addLog("INFO", fmt.Sprintf("Client identified as: %s", deviceName))
+					addLog("INFO", fmt.Sprintf("Client identified: %s (User: %s)", deviceName, user.Username))
 				}
-			} else if msgType == "client_log" {
-				// Handle remote logging from client
-				message, _ := msg["message"].(string)
-				level, _ := msg["level"].(string)
-				if level == "" { level = "INFO" }
-				
-				// Prefix with device name for clarity
-				addLog(level, fmt.Sprintf("[%s] %s", deviceName, message))
-			} else {
-				addLog("INFO", fmt.Sprintf("Received message from %s: %s", deviceName, msgType))
 			}
 		}
+
+		broadcast <- msg
 	}
 
 	state.mu.Lock()
@@ -274,9 +370,8 @@ func handleMessages() {
 		for client := range state.Clients {
 			err := client.WriteJSON(msg)
 			if err != nil {
-				log.Printf("WebSocket write error: %v", err)
 				client.Close()
-				// Deletion happens in read loop
+				delete(state.Clients, client)
 			}
 		}
 		state.mu.RUnlock()
@@ -284,217 +379,192 @@ func handleMessages() {
 }
 
 func handleListFiles(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	user, ok := getUserFromContext(r)
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	state.mu.RLock()
-	defer state.mu.RUnlock()
+	ufs := getUserFileState(user.ID)
+	ufs.mu.RLock()
+	defer ufs.mu.RUnlock()
 
-	list := make([]FileMetadata, 0, len(state.Files))
-	for _, meta := range state.Files {
-		list = append(list, meta)
+	files := make([]FileMetadata, 0, len(ufs.Files))
+	for _, meta := range ufs.Files {
+		files = append(files, meta)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(list)
+	json.NewEncoder(w).Encode(files)
 }
 
 func handleFileOperations(w http.ResponseWriter, r *http.Request) {
-	filePath := r.URL.Query().Get("path")
-	if filePath == "" {
-		http.Error(w, "Missing 'path' query parameter", http.StatusBadRequest)
+	user, ok := getUserFromContext(r)
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	if r.Method == http.MethodGet {
-		// Serve file - check if a specific version is requested
-		version := r.URL.Query().Get("version")
-
-		state.mu.RLock()
-		meta, exists := state.Files[filePath]
-		state.mu.RUnlock()
-
-		if !exists {
-			http.Error(w, "File not found", http.StatusNotFound)
-			return
-		}
-
-		var hashToServe string
-
-		if version != "" {
-			// Specific version requested - check if it exists in history
-			versionExists := false
-			for _, v := range meta.History {
-				if v.Hash == version {
-					hashToServe = v.Hash
-					versionExists = true
-					break
-				}
-			}
-			if !versionExists {
-				http.Error(w, "File version not found", http.StatusNotFound)
-				return
-			}
-			addLog("INFO", fmt.Sprintf("Serving version %s of file: %s", version, filePath))
-		} else {
-			// Serve latest version (default behavior)
-			hashToServe = meta.Latest.Hash
-			addLog("INFO", fmt.Sprintf("Serving latest version of file: %s (%s)", filePath, hashToServe))
-		}
-
-		// Serve the requested version from the history blob storage
-		blobPath := filepath.Join(config.DataDir, ".history", hashToServe)
-
-		// Check if blob exists
-		if _, err := os.Stat(blobPath); err == nil {
-			http.ServeFile(w, r, blobPath)
-			return
-		} else {
-			http.Error(w, "File blob not found", http.StatusNotFound)
-			return
-		}
-	}
-
-	if r.Method == http.MethodPut {
-		// Upload
-		// 1. Save content to a temporary file to calculate hash
-		tempDir := filepath.Join(config.DataDir, ".temp")
-		if err := os.MkdirAll(tempDir, 0755); err != nil {
-			http.Error(w, "Failed to create temp dir", http.StatusInternalServerError)
-			return
-		}
-		tempFile, err := os.CreateTemp(tempDir, "upload-*")
-		if err != nil {
-			http.Error(w, "Failed to create temp file", http.StatusInternalServerError)
-			return
-		}
-		defer os.Remove(tempFile.Name()) // Cleanup temp file
-
-		hasher := sha256.New()
-		reader := io.TeeReader(r.Body, hasher)
-
-		if _, err := io.Copy(tempFile, reader); err != nil {
-			tempFile.Close()
-			http.Error(w, "Failed to write temp file", http.StatusInternalServerError)
-			return
-		}
-		tempFile.Close()
-
-		newHash := hex.EncodeToString(hasher.Sum(nil))
-		deviceName := r.Header.Get("X-Device-Name")
-		if deviceName == "" {
-			deviceName = "Unknown"
-		}
-		baseHash := r.Header.Get("X-Base-Hash")
-
-		// 2. Check for Conflict
-		state.mu.Lock()
-		meta, exists := state.Files[filePath]
-		isConflict := false
-		
-		if exists {
-			// If client provides base hash, check it against latest
-			if baseHash != "" && baseHash != meta.Latest.Hash {
-				addLog("WARN", fmt.Sprintf("Conflict detected for %s. Client base: %s, Server head: %s", filePath, baseHash, meta.Latest.Hash))
-				isConflict = true
-			}
-		} else {
-			// New file
-			meta = FileMetadata{
-				Path:    filePath,
-				History: make([]FileVersion, 0),
-			}
-		}
-
-		// 3. Move temp file to blob storage (.history/{hash})
-		blobDir := filepath.Join(config.DataDir, ".history")
-		if err := os.MkdirAll(blobDir, 0755); err != nil {
-			state.mu.Unlock()
-			http.Error(w, "Failed to create history dir", http.StatusInternalServerError)
-			return
-		}
-		blobPath := filepath.Join(blobDir, newHash)
-		
-		// Only move if blob doesn't exist (deduplication)
-		if _, err := os.Stat(blobPath); os.IsNotExist(err) {
-			if err := os.Rename(tempFile.Name(), blobPath); err != nil {
-				// Fallback copy if rename fails (e.g. different devices)
-				input, _ := os.ReadFile(tempFile.Name())
-				os.WriteFile(blobPath, input, 0644)
-			}
-		}
-
-		// 4. Update Metadata
-		newVersion := FileVersion{
-			Hash:      newHash,
-			Timestamp: time.Now().UnixMilli(),
-			Device:    deviceName,
-		}
-		
-		meta.History = append(meta.History, newVersion)
-		meta.Latest = newVersion
-		state.Files[filePath] = meta
-		saveMetadata()
-		state.mu.Unlock()
-
-		// 5. Also update the "Working Copy" for easy user browsing on server
-		// This is optional but good for the "Local Lite" feel where users can see files.
-		cleanPath := filepath.Join("/", filePath)
-		workPath := filepath.Join(config.DataDir, cleanPath)
-		os.MkdirAll(filepath.Dir(workPath), 0755)
-		// We can just hardlink or copy. Copy is safer.
-		if src, err := os.ReadFile(blobPath); err == nil {
-			os.WriteFile(workPath, src, 0644)
-		}
-
-		addLog("INFO", fmt.Sprintf("File updated: %s (Hash: %s, Conflict: %v)", filePath, newHash, isConflict))
-
-		broadcast <- map[string]interface{}{
-			"type": "file_updated",
-			"file": meta,
-		}
-
-		if isConflict {
-			w.Header().Set("X-Conflict", "true")
-			w.WriteHeader(http.StatusConflict) // 409
-		} else {
-			w.WriteHeader(http.StatusOK)
-		}
-		json.NewEncoder(w).Encode(meta)
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		http.Error(w, "Missing path parameter", http.StatusBadRequest)
 		return
 	}
 
-	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	ufs := getUserFileState(user.ID)
+
+	switch r.Method {
+	case "GET":
+		handleGetFile(w, r, user.ID, path, ufs)
+	case "PUT":
+		handlePutFile(w, r, user.ID, path, ufs)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
-func handleSearch(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+func handleGetFile(w http.ResponseWriter, r *http.Request, userID, path string, ufs *UserFileState) {
+	ufs.mu.RLock()
+	meta, exists := ufs.Files[path]
+	ufs.mu.RUnlock()
+
+	if !exists {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+
+	blobPath := filepath.Join(getUserDataDir(userID), meta.Latest.Hash)
+	data, err := os.ReadFile(blobPath)
+	if err != nil {
+		http.Error(w, "Failed to read file", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write(data)
+}
+
+func handlePutFile(w http.ResponseWriter, r *http.Request, userID, path string, ufs *UserFileState) {
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read body", http.StatusBadRequest)
+		return
+	}
+
+	// Calculate hash
+	hash := sha256.Sum256(data)
+	hashStr := hex.EncodeToString(hash[:])
+
+	// Save blob
+	blobPath := filepath.Join(getUserDataDir(userID), hashStr)
+	if err := os.WriteFile(blobPath, data, 0644); err != nil {
+		http.Error(w, "Failed to save file", http.StatusInternalServerError)
+		return
+	}
+
+	device := r.URL.Query().Get("device")
+	if device == "" {
+		device = "unknown"
+	}
+
+	version := FileVersion{
+		Hash:      hashStr,
+		Timestamp: time.Now().Unix(),
+		Device:    device,
+	}
+
+	ufs.mu.Lock()
+	meta, exists := ufs.Files[path]
+	if !exists {
+		meta = FileMetadata{
+			Path:    path,
+			History: []FileVersion{},
+		}
+	}
+	meta.History = append(meta.History, version)
+	meta.Latest = version
+	ufs.Files[path] = meta
+	ufs.mu.Unlock()
+
+	saveUserMetadata(userID, ufs)
+
+	addLog("INFO", fmt.Sprintf("File uploaded: %s (User: %s)", path, userID))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "ok",
+		"hash":   hashStr,
+	})
+
+	broadcast <- map[string]interface{}{
+		"type": "file_updated",
+		"path": path,
+		"hash": hashStr,
+	}
+}
+
+func handleBulkDelete(w http.ResponseWriter, r *http.Request) {
+	user, ok := getUserFromContext(r)
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	query := strings.ToLower(r.URL.Query().Get("q"))
-	
-	state.mu.RLock()
-	defer state.mu.RUnlock()
+	patterns := r.URL.Query().Get("patterns")
+	if patterns == "" {
+		http.Error(w, "Missing patterns parameter", http.StatusBadRequest)
+		return
+	}
 
-	totalFiles := len(state.Files)
-	
-	results := make([]FileMetadata, 0)
-	for path, meta := range state.Files {
-		if query == "" || strings.Contains(strings.ToLower(path), query) {
-			results = append(results, meta)
-			if len(results) >= 100 { // Increased limit
+	patternList := strings.Split(patterns, ",")
+	ufs := getUserFileState(user.ID)
+
+	ufs.mu.Lock()
+	deleted := 0
+	for path := range ufs.Files {
+		for _, pattern := range patternList {
+			pattern = strings.TrimSpace(pattern)
+			if strings.Contains(path, pattern) {
+				delete(ufs.Files, path)
+				deleted++
 				break
 			}
 		}
 	}
-	
-	// Debug log if results are empty but files exist
-	if len(results) == 0 && totalFiles > 0 {
-		addLog("WARN", fmt.Sprintf("Search returned 0 results despite %d files existing. Query: '%s'", totalFiles, query))
+	ufs.mu.Unlock()
+
+	saveUserMetadata(user.ID, ufs)
+	addLog("INFO", fmt.Sprintf("Bulk delete: %d files (User: %s)", deleted, user.Username))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"deleted": deleted,
+	})
+}
+
+func handleSearch(w http.ResponseWriter, r *http.Request) {
+	user, ok := getUserFromContext(r)
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	query := r.URL.Query().Get("q")
+	ufs := getUserFileState(user.ID)
+
+	ufs.mu.RLock()
+	defer ufs.mu.RUnlock()
+
+	results := make([]FileMetadata, 0)
+	for _, meta := range ufs.Files {
+		if strings.Contains(meta.Path, query) {
+			results = append(results, meta)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -502,519 +572,97 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleCleanup(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
+	user, ok := getUserFromContext(r)
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	state.mu.RLock()
-	// Collect used hashes
-	usedHashes := make(map[string]bool)
-	for _, meta := range state.Files {
-		usedHashes[meta.Latest.Hash] = true
-		for _, v := range meta.History {
-			usedHashes[v.Hash] = true
+	ufs := getUserFileState(user.ID)
+	ufs.mu.RLock()
+	validHashes := make(map[string]bool)
+	for _, meta := range ufs.Files {
+		for _, version := range meta.History {
+			validHashes[version.Hash] = true
 		}
 	}
-	state.mu.RUnlock()
+	ufs.mu.RUnlock()
 
-	// Walk .history dir
-	historyDir := filepath.Join(config.DataDir, ".history")
-	entries, err := os.ReadDir(historyDir)
+	userDir := getUserDataDir(user.ID)
+	entries, err := os.ReadDir(userDir)
 	if err != nil {
-		http.Error(w, "Failed to read history dir", http.StatusInternalServerError)
+		http.Error(w, "Failed to read directory", http.StatusInternalServerError)
 		return
 	}
 
-	deletedCount := 0
-	var deletedSize int64 = 0
+	deletedBlobs := 0
+	freedBytes := int64(0)
 
 	for _, entry := range entries {
-		if entry.IsDir() {
+		if entry.IsDir() || entry.Name() == "metadata.json" {
 			continue
 		}
-		hash := entry.Name()
-		if !usedHashes[hash] {
-			info, err := entry.Info()
-			if err == nil {
-				if time.Since(info.ModTime()) < 10*time.Minute {
-					continue // Skip young files to avoid race with upload
-				}
-				deletedSize += info.Size()
+
+		if !validHashes[entry.Name()] {
+			path := filepath.Join(userDir, entry.Name())
+			if info, err := os.Stat(path); err == nil {
+				freedBytes += info.Size()
 			}
-			err = os.Remove(filepath.Join(historyDir, hash))
-			if err == nil {
-				deletedCount++
-			} else {
-				log.Printf("Failed to delete blob %s: %v", hash, err)
+			if err := os.Remove(path); err == nil {
+				deletedBlobs++
 			}
 		}
 	}
 
-	addLog("INFO", fmt.Sprintf("Cleanup: Removed %d orphaned blobs (%d bytes)", deletedCount, deletedSize))
+	addLog("INFO", fmt.Sprintf("Cleanup: removed %d blobs, freed %d bytes (User: %s)", deletedBlobs, freedBytes, user.Username))
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"deletedBlobs": deletedCount,
-		"freedBytes":   deletedSize,
+		"deletedBlobs": deletedBlobs,
+		"freedBytes":   freedBytes,
 	})
 }
 
 func handleReset(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
+	user, ok := getUserFromContext(r)
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	state.mu.Lock()
-	// defer state.mu.Unlock() // Removed to avoid deadlock with addLog
-
-	// 1. Clear Memory State
-	state.Files = make(map[string]FileMetadata)
-	state.Logs = append(state.Logs, LogEntry{
-		Timestamp: time.Now(),
-		Message:   "Server reset initiated. All data cleared.",
-		Level:     "WARN",
-	})
-
-	// 2. Clear Disk Data
-	// Dangerous operation, ensure DataDir is correct relative path to avoid mishaps
-	// We defined DataDir as "./data", so it should be safe within project.
-	if err := os.RemoveAll(config.DataDir); err != nil {
-		state.mu.Unlock() // Unlock before error return
-		log.Printf("Failed to remove data dir: %v", err)
-		http.Error(w, "Failed to clear data directory", http.StatusInternalServerError)
+	userDir := getUserDataDir(user.ID)
+	if err := os.RemoveAll(userDir); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to reset: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Recreate DataDir
-	if err := os.MkdirAll(config.DataDir, 0755); err != nil {
-		state.mu.Unlock() // Unlock before error return
-		log.Printf("Failed to recreate data dir: %v", err)
-		http.Error(w, "Failed to recreate data directory", http.StatusInternalServerError)
+	if err := os.MkdirAll(userDir, 0755); err != nil {
+		http.Error(w, "Failed to recreate directory", http.StatusInternalServerError)
 		return
 	}
 
-	// 3. Save Empty Metadata
-	saveMetadata()
+	ufs := getUserFileState(user.ID)
+	ufs.mu.Lock()
+	ufs.Files = make(map[string]FileMetadata)
+	ufs.mu.Unlock()
 
-	state.mu.Unlock() // Unlock here!
+	saveUserMetadata(user.ID, ufs)
 
-	addLog("WARN", "System Reset: All files and history have been wiped.")
-
-	// 4. Broadcast
-	broadcast <- map[string]interface{}{
-		"type": "server_reset",
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "Server reset complete"})
-}
-
-func handleBulkDelete(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete && r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	patternsParam := r.URL.Query().Get("patterns")
-	if patternsParam == "" {
-		// Fallback to old 'extensions' for backward compatibility if needed, 
-		// but let's just enforce 'patterns' for the new UI.
-		patternsParam = r.URL.Query().Get("extensions")
-	}
-
-	if patternsParam == "" {
-		http.Error(w, "Missing 'patterns' query parameter", http.StatusBadRequest)
-		return
-	}
-
-	patterns := strings.Split(patternsParam, ",")
-	for i, p := range patterns {
-		patterns[i] = strings.TrimSpace(p)
-	}
-
-	state.mu.Lock()
-	// defer state.mu.Unlock() // Removed to avoid deadlock
-
-	deletedCount := 0
-	var deletedPaths []string
-
-	// Collect keys to delete first to avoid modifying map while iterating (though Go handles it, it's cleaner)
-	toDelete := make([]string, 0)
-
-	for path := range state.Files {
-		match := false
-		for _, p := range patterns {
-			if p == "" { continue }
-
-			// 1. Exact Match
-			if p == path {
-				match = true
-				break
-			}
-
-			// 2. Suffix Match (e.g., *.jpg)
-			if strings.HasPrefix(p, "*") {
-				suffix := p[1:]
-				// Case-insensitive suffix match? User asked for *.jpg, usually implies case insensitivity on some OSs.
-				// Let's be strict unless we want to enforce lowercase everywhere. 
-				// Given previous implementation was lowercase, let's do case-insensitive suffix for convenience.
-				if strings.HasSuffix(strings.ToLower(path), strings.ToLower(suffix)) {
-					match = true
-					break
-				}
-			}
-
-			// 3. Glob Match (path/filepath)
-			if matched, _ := filepath.Match(p, path); matched {
-				match = true
-				break
-			}
-		}
-
-		if match {
-			toDelete = append(toDelete, path)
-		}
-	}
-
-	for _, path := range toDelete {
-		localPath := filepath.Join(config.DataDir, path)
-		if err := os.Remove(localPath); err != nil {
-			if !os.IsNotExist(err) {
-				log.Printf("Failed to delete file %s: %v", localPath, err)
-			}
-		}
-		delete(state.Files, path)
-		deletedPaths = append(deletedPaths, path)
-		deletedCount++
-	}
-	
-	remaining := len(state.Files)
-
-	if deletedCount > 0 {
-		saveMetadata()
-	}
-	state.mu.Unlock()
-
-	addLog("INFO", fmt.Sprintf("Deleted %d files from memory map.", deletedCount))
-
-	if deletedCount > 0 {
-		addLog("INFO", fmt.Sprintf("Bulk deleted %d files matching: %s", deletedCount, patternsParam))
-		
-		// Broadcast deletions so clients can update
-		for _, path := range deletedPaths {
-			broadcast <- map[string]interface{}{
-				"type": "file_deleted",
-				"path": path,
-			}
-		}
-	}
+	addLog("INFO", fmt.Sprintf("Server reset by user: %s", user.Username))
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"deleted":   deletedCount,
-		"paths":     deletedPaths,
-		"remaining": remaining,
+		"status": "reset_complete",
 	})
 }
 
-func loadMetadata() {
-	state.mu.Lock()
-	defer state.mu.Unlock()
-
-	data, err := os.ReadFile(MetadataFile)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			log.Println("Error reading metadata:", err)
-		}
-		return
-	}
-
-	var fileList []FileMetadata
-	if err := json.Unmarshal(data, &fileList); err != nil {
-		log.Println("Error parsing metadata:", err)
-		return
-	}
-
-	for _, f := range fileList {
-		state.Files[f.Path] = f
-	}
-}
-
-// saveMetadata assumes state.mu is locked by the caller
-func saveMetadata() {
-	list := make([]FileMetadata, 0, len(state.Files))
-	for _, meta := range state.Files {
-		list = append(list, meta)
-	}
-
-	data, err := json.MarshalIndent(list, "", "  ")
-	if err != nil {
-		log.Println("Error marshalling metadata:", err)
-		return
-	}
-
-	if err := os.WriteFile(MetadataFile, data, 0644); err != nil {
-		log.Println("Error writing metadata:", err)
-	}
-}
-
-const dashboardHTML = `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>GoSync Server Dashboard</title>
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 20px; background: #f4f4f9; color: #333; }
-        .container { max-width: 1000px; margin: 0 auto; }
-        .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 20px; }
-        h2 { margin-top: 0; }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #eee; }
-        th { background: #fafafa; }
-        .log-entry { font-family: monospace; padding: 5px 0; border-bottom: 1px solid #f0f0f0; }
-        .log-INFO { color: #0052cc; }
-        .log-ERROR { color: #cc0000; }
-        .log-CONNECT { color: #008000; }
-        .status-badge { display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; }
-        .status-online { background: #e3fcef; color: #006644; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>GoSync Server</h1>
-        
-        <div class="card">
-            <h2>Connected Devices</h2>
-            <table id="clientsTable">
-                <thead><tr><th>Name</th><th>IP</th><th>Connected At</th></tr></thead>
-                <tbody><!-- JS will populate --></tbody>
-            </table>
-        </div>
-
-        <div class="card">
-            <h2>Stats</h2>
-            <p>Total Files Tracked: <span id="fileCount">0</span></p>
-        </div>
-
-        <div class="card">
-            <h2>File Browser</h2>
-            <input type="text" id="fileSearch" placeholder="Search files..." style="width: 100%; padding: 10px; box-sizing: border-box; margin-bottom: 10px;">
-            <div style="display:flex; gap: 10px; height: 400px;">
-                <div id="fileList" style="flex: 1; overflow-y: auto; border: 1px solid #eee;"></div>
-                <div style="flex: 2; display: flex; flex-direction: column; gap: 10px;">
-                    <div id="fileHistory" style="flex: 1; overflow-y: auto; border: 1px solid #eee; padding: 5px; display: none;">
-                        <h4 style="margin: 0 0 5px 0;">History</h4>
-                        <ul id="historyList" style="list-style: none; padding: 0; margin: 0;"></ul>
-                    </div>
-                    <div id="filePreview" style="flex: 2; border: 1px solid #eee; padding: 10px; background: #fafafa; overflow: auto; display: flex; align-items: center; justify-content: center;">
-                        <p style="color: #999;">Select a file to preview</p>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <div class="card">
-            <h2>Maintenance</h2>
-            <div style="display: flex; gap: 10px;">
-                <input type="text" id="deletePatterns" placeholder="*.jpg, specific/file.png" style="flex-grow: 1; padding: 10px; box-sizing: border-box;">
-                <button onclick="deleteFiles()" style="padding: 10px 20px; background: #cc0000; color: white; border: none; border-radius: 4px; cursor: pointer;">Delete Files</button>
-            </div>
-            <p style="color: #666; font-size: 0.9em; margin-top: 5px;">Deletes files matching the patterns. Use <b>*</b> for wildcards (e.g., <b>*.png</b>).</p>
-            
-            <hr style="border: 0; border-top: 1px solid #eee; margin: 15px 0;">
-            
-            <div style="display: flex; align-items: center; justify-content: space-between;">
-                <div>
-                    <h3 style="margin: 0;">Clean Up History</h3>
-                    <p style="color: #666; font-size: 0.9em; margin: 5px 0 0 0;">Delete version data for files that no longer exist.</p>
-                </div>
-                <button onclick="cleanupHistory()" style="padding: 10px 20px; background: #666; color: white; border: none; border-radius: 4px; cursor: pointer;">Clean Up</button>
-            </div>
-
-            <hr style="border: 0; border-top: 1px solid #eee; margin: 15px 0;">
-
-            <div style="display: flex; align-items: center; justify-content: space-between;">
-                <div>
-                    <h3 style="margin: 0; color: #cc0000;">Danger Zone</h3>
-                    <p style="color: #666; font-size: 0.9em; margin: 5px 0 0 0;">Delete ALL files and history. Start fresh.</p>
-                </div>
-                <button onclick="resetServer()" style="padding: 10px 20px; background: #cc0000; color: white; border: none; border-radius: 4px; cursor: pointer;">Start Fresh</button>
-            </div>
-        </div>
-
-        <div class="card">
-            <h2>Server Logs</h2>
-            <div id="logs" style="max-height: 400px; overflow-y: auto;"></div>
-        </div>
-    </div>
-
-    <script>
-        function fetchStatus() {
-            fetch('/api/status')
-                .then(r => r.json())
-                .then(data => {
-                    // Clients
-                    const tbody = document.querySelector('#clientsTable tbody');
-                    tbody.innerHTML = data.clients.map(c => 
-                        '<tr><td>' + c.name + '</td><td>' + c.ip + '</td><td>' + new Date(c.connectedAt).toLocaleTimeString() + '</td></tr>'
-                    ).join('');
-
-                    // Stats
-                    document.getElementById('fileCount').textContent = data.fileCount;
-
-                    // Logs
-                    const logsDiv = document.getElementById('logs');
-                    logsDiv.innerHTML = data.logs.slice().reverse().map(l => 
-                        '<div class="log-entry log-' + l.level + '">' + 
-                        '[' + new Date(l.timestamp).toLocaleTimeString() + '] ' + l.message + 
-                        '</div>'
-                    ).join('');
-                });
-        }
-        
-        setInterval(fetchStatus, 2000);
-        fetchStatus();
-
-        // File Browser Logic
-        const searchInput = document.getElementById('fileSearch');
-        const fileList = document.getElementById('fileList');
-        const filePreview = document.getElementById('filePreview');
-        const fileHistory = document.getElementById('fileHistory');
-        const historyList = document.getElementById('historyList');
-
-        // Initial load
-        loadFiles('');
-
-        searchInput.addEventListener('input', (e) => {
-            loadFiles(e.target.value);
-        });
-
-        function loadFiles(q) {
-            fetch('/api/search?q=' + encodeURIComponent(q))
-                .then(r => r.json())
-                .then(files => {
-                    if (files.length === 0) {
-                        fileList.innerHTML = '<div style="padding:5px; color:#999;">No files found</div>';
-                        return;
-                    }
-                    fileList.innerHTML = files.map(f => 
-                        "<div class='file-item' onclick='selectFile(" + JSON.stringify(f).replace(/'/g, "\\'") + ")' style='padding: 5px; cursor: pointer; border-bottom: 1px solid #f0f0f0; font-family: monospace;'>" + 
-                        f.path + 
-                        "</div>"
-                    ).join('');
-                });
-        }
-
-        window.selectFile = function(file) {
-            // Show latest
-            viewFile(file.path);
-            
-            // Show History
-            fileHistory.style.display = 'block';
-            const versions = file.history || [file.latest]; 
-            // Reverse to show newest first
-            historyList.innerHTML = versions.slice().reverse().map(v => {
-                const date = new Date(v.timestamp).toLocaleString();
-                return '<li style="padding: 4px; border-bottom: 1px solid #eee; cursor: pointer;" onclick="viewBlob(\'' + v.hash + '\', \'' + file.path.replace(/'/g, "\\'") + '\')">' +
-                    '<b>' + date + '</b><br>' +
-                    '<span style="font-size: 0.8em; color: #666;">' + v.device + ' (' + v.hash.substr(0,7) + ')</span>' +
-                '</li>';
-            }).join('');
-        }
-
-        window.viewBlob = function(hash, path) {
-             // Now we can use the version parameter to get the specific file version
-             viewFileVersion(path, hash);
-        }
-
-        window.viewFileVersion = function(path, version) {
-            let url;
-            if (version) {
-                url = '/api/file?path=' + encodeURIComponent(path) + '&version=' + encodeURIComponent(version);
-            } else {
-                url = '/api/file?path=' + encodeURIComponent(path);
-            }
-            const ext = path.split('.').pop().toLowerCase();
-            const isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg'].includes(ext);
-
-            filePreview.innerHTML = '<p>Loading...</p>';
-
-            if (isImage) {
-                filePreview.innerHTML = '<img src="' + url + '" style="max-width: 100%; max-height: 100%; display: block; margin: auto;">';
-            } else {
-                fetch(url)
-                    .then(r => r.text())
-                    .then(text => {
-                        filePreview.innerHTML = '<pre style="white-space: pre-wrap; word-break: break-all; text-align: left; margin: 0;">' + text.replace(/</g, '&lt;') + '</pre>';
-                    })
-                    .catch(err => {
-                        filePreview.innerHTML = '<p style="color:red">Error loading file</p>';
-                    });
-            }
-        }
-
-        window.viewFile = function(path) {
-            viewFileVersion(path, null); // null means latest version
-        }
-
-        function deleteFiles() {
-            const patterns = document.getElementById('deletePatterns').value;
-            if (!patterns) {
-                alert('Please enter patterns to delete');
-                return;
-            }
-            if (!confirm('Are you sure you want to delete files matching: ' + patterns + '? This cannot be undone.')) {
-                return;
-            }
-
-            fetch('/api/files/delete?patterns=' + encodeURIComponent(patterns), { method: 'POST' })
-                .then(r => r.json())
-                .then(data => {
-                    alert('Deleted ' + data.deleted + ' files.');
-                    fetchStatus(); 
-                    loadFiles(document.getElementById('fileSearch').value || ''); 
-                })
-                .catch(err => alert('Error: ' + err));
-        }
-
-        function cleanupHistory() {
-            if (!confirm('Are you sure you want to clean up orphaned version history? This will delete data for files that have been deleted.')) {
-                return;
-            }
-            fetch('/api/cleanup', { method: 'POST' })
-                .then(r => r.json())
-                .then(data => {
-                    alert('Cleanup complete.\nDeleted Blobs: ' + data.deletedBlobs + '\nFreed Bytes: ' + data.freedBytes);
-                })
-                .catch(err => alert('Error: ' + err));
-        }
-
-        function resetServer() {
-            if (!confirm('WARNING: This will delete ALL files and history from the server. This action cannot be undone. Are you sure?')) {
-                return;
-            }
-            if (!confirm('Double check: You are about to WIPE EVERYTHING. Proceed?')) {
-                return;
-            }
-            
-            fetch('/api/reset', { method: 'POST' })
-                .then(r => {
-                    if (!r.ok) {
-                        return r.text().then(text => { throw new Error(text || r.statusText) });
-                    }
-                    return r.json();
-                })
-                .then(data => {
-                    alert('Server reset complete.');
-                    window.location.reload();
-                })
-                .catch(err => alert('Error: ' + err));
-        }
-    </script>
-</body>
-</html>
-`
