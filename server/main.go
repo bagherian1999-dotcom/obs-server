@@ -82,8 +82,6 @@ func main() {
 		log.Printf("Warning: Could not load config file (%v), using defaults", err)
 	}
 
-	DataDir := config.DataDir
-	
 	// Ensure data directory exists
 	if err := os.MkdirAll(config.DataDir, 0755); err != nil {
 		log.Fatal("Failed to create data directory:", err)
