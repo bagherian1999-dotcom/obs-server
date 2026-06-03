@@ -345,7 +345,7 @@ func handleFileOperations(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Serve the requested version from the history blob storage
-		blobPath := filepath.Join(DataDir, ".history", hashToServe)
+		blobPath := filepath.Join(config.DataDir, ".history", hashToServe)
 
 		// Check if blob exists
 		if _, err := os.Stat(blobPath); err == nil {
@@ -360,7 +360,7 @@ func handleFileOperations(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPut {
 		// Upload
 		// 1. Save content to a temporary file to calculate hash
-		tempDir := filepath.Join(DataDir, ".temp")
+		tempDir := filepath.Join(config.DataDir, ".temp")
 		if err := os.MkdirAll(tempDir, 0755); err != nil {
 			http.Error(w, "Failed to create temp dir", http.StatusInternalServerError)
 			return
@@ -409,7 +409,7 @@ func handleFileOperations(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// 3. Move temp file to blob storage (.history/{hash})
-		blobDir := filepath.Join(DataDir, ".history")
+		blobDir := filepath.Join(config.DataDir, ".history")
 		if err := os.MkdirAll(blobDir, 0755); err != nil {
 			state.mu.Unlock()
 			http.Error(w, "Failed to create history dir", http.StatusInternalServerError)
@@ -442,7 +442,7 @@ func handleFileOperations(w http.ResponseWriter, r *http.Request) {
 		// 5. Also update the "Working Copy" for easy user browsing on server
 		// This is optional but good for the "Local Lite" feel where users can see files.
 		cleanPath := filepath.Join("/", filePath)
-		workPath := filepath.Join(DataDir, cleanPath)
+		workPath := filepath.Join(config.DataDir, cleanPath)
 		os.MkdirAll(filepath.Dir(workPath), 0755)
 		// We can just hardlink or copy. Copy is safer.
 		if src, err := os.ReadFile(blobPath); err == nil {
@@ -519,7 +519,7 @@ func handleCleanup(w http.ResponseWriter, r *http.Request) {
 	state.mu.RUnlock()
 
 	// Walk .history dir
-	historyDir := filepath.Join(DataDir, ".history")
+	historyDir := filepath.Join(config.DataDir, ".history")
 	entries, err := os.ReadDir(historyDir)
 	if err != nil {
 		http.Error(w, "Failed to read history dir", http.StatusInternalServerError)
@@ -580,7 +580,7 @@ func handleReset(w http.ResponseWriter, r *http.Request) {
 	// 2. Clear Disk Data
 	// Dangerous operation, ensure DataDir is correct relative path to avoid mishaps
 	// We defined DataDir as "./data", so it should be safe within project.
-	if err := os.RemoveAll(DataDir); err != nil {
+	if err := os.RemoveAll(config.DataDir); err != nil {
 		state.mu.Unlock() // Unlock before error return
 		log.Printf("Failed to remove data dir: %v", err)
 		http.Error(w, "Failed to clear data directory", http.StatusInternalServerError)
@@ -679,7 +679,7 @@ func handleBulkDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, path := range toDelete {
-		localPath := filepath.Join(DataDir, path)
+		localPath := filepath.Join(config.DataDir, path)
 		if err := os.Remove(localPath); err != nil {
 			if !os.IsNotExist(err) {
 				log.Printf("Failed to delete file %s: %v", localPath, err)
