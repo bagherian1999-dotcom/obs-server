@@ -77,6 +77,23 @@ func enableCorsWithAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// enableCors adds CORS headers for public endpoints
+func enableCors(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next(w, r)
+	}
+}
+
 // validateUserAccess checks if a user can access a specific resource
 func validateUserAccess(requestedUserID string, authenticatedUser *User) bool {
 	return requestedUserID == authenticatedUser.ID
