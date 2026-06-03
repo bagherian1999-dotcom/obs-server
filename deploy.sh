@@ -68,7 +68,7 @@ echo "Configuration saved to server/config.json"
 
 echo ""
 echo "=== Building Server Binary ==="
-go build -o gosync-server main.go config.go
+go build -o gosync-server main.go config.go auth.go middleware.go handlers_auth.go dashboard.go
 
 echo ""
 echo "=== Setup Complete! ==="
